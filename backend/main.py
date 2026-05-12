@@ -70,6 +70,14 @@ SMS_API_TIMEOUT_SECONDS = float(os.getenv("SMS_API_TIMEOUT_SECONDS", "10"))
 SMS_RETRY_WITHOUT_LINKS_ON_BLOCK = os.getenv("SMS_RETRY_WITHOUT_LINKS_ON_BLOCK", "1").strip().lower() in (
     "1", "true", "yes", "on"
 )
+SMS_TEST_MESSAGE = os.getenv(
+    "SMS_TEST_MESSAGE",
+    "SafeSight notice for {name}: alert log updated at {camera} ({location}). Ref {ref}.",
+).strip()
+SMS_TEST_SPAM_FALLBACK_MESSAGE = os.getenv(
+    "SMS_TEST_SPAM_FALLBACK_MESSAGE",
+    "SafeSight notice for {name}: reference {ref}. Contact admin if unexpected.",
+).strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8001").strip().rstrip("/")
 PUBLIC_VIDEO_TOKEN_SECRET = (os.getenv("PUBLIC_VIDEO_TOKEN_SECRET", SECRET_KEY) or SECRET_KEY).strip()
 PUBLIC_VIDEO_TOKEN_TTL_SECONDS = max(int(os.getenv("PUBLIC_VIDEO_TOKEN_TTL_SECONDS", "86400")), 60)
@@ -2078,6 +2086,19 @@ def _provider_rejected_links(send_result: dict) -> bool:
     has_block_term = any(token in haystack for token in ("prohibit", "forbid", "not allowed", "blocked"))
     return has_link_term and has_block_term
 
+def _provider_rejected_spam(send_result: dict) -> bool:
+    if not isinstance(send_result, dict):
+        return False
+
+    haystack = " ".join(
+        [
+            str(send_result.get("error") or ""),
+            str(send_result.get("response") or ""),
+        ]
+    ).lower()
+
+    return "spam" in haystack
+
 def _strip_urls_from_alert_message(message: str) -> str:
     text = str(message or "")
     # Remove replay section first to keep punctuation natural.
@@ -2087,9 +2108,53 @@ def _strip_urls_from_alert_message(message: str) -> str:
     text = re.sub(r"\s+([.,!?;:])", r"\1", text)
     return text.strip()
 
+def _format_test_sms_message(
+    template: str,
+    cam_name: str,
+    cam_location: str,
+    recipient_name: Optional[str] = None,
+) -> str:
+    message = str(template or "").strip()
+    if not message:
+        return message
+
+    if "{ref}" in message:
+        ref_code = uuid.uuid4().hex[:6].upper()
+        message = message.replace("{ref}", ref_code)
+
+    if "{camera}" in message:
+        message = message.replace("{camera}", str(cam_name or ""))
+    if "{location}" in message:
+        message = message.replace("{location}", str(cam_location or ""))
+    if "{name}" in message:
+        name_value = str(recipient_name or "").strip() or "Responder"
+        message = message.replace("{name}", name_value)
+
+    return message
+
+def _format_sms_recipient_for_provider(recipient_phone: str) -> str:
+    raw = str(recipient_phone or "").strip()
+    if not raw:
+        return raw
+
+    sms_url = (SMS_API_URL or "").lower()
+    if "unismsapi.com" not in sms_url:
+        return raw
+
+    digits = "".join(ch for ch in raw if ch.isdigit())
+    if raw.startswith("+") and len(digits) >= 10:
+        return f"+{digits}"
+    if digits.startswith("0") and len(digits) == 11:
+        return f"+63{digits[1:]}"
+    if digits.startswith("63") and len(digits) == 12:
+        return f"+{digits}"
+
+    return raw
+
 def _build_sms_payload(recipient_phone: str, message: str) -> dict:
+    recipient_value = _format_sms_recipient_for_provider(recipient_phone)
     payload = {
-        SMS_API_TO_FIELD or "to": recipient_phone,
+        SMS_API_TO_FIELD or "to": recipient_value,
         SMS_API_MESSAGE_FIELD or "message": message,
     }
     if SMS_API_FROM:
@@ -4083,8 +4148,11 @@ async def send_test_sms(body: SmsTestRequest, db=Depends(get_db), captain=Depend
     cam_name = camera["name"] if camera else "Unknown camera"
     cam_location = camera["location"] if camera else "Unknown location"
 
-    message = body.message.strip() if body.message and body.message.strip() else (
-        f"TEST SMS ALERT: Accident occurred at {cam_name} ({cam_location}). Please verify and respond."
+    default_test_message = SMS_TEST_MESSAGE.strip() if SMS_TEST_MESSAGE else ""
+    base_message = body.message.strip() if body.message and body.message.strip() else (
+        default_test_message
+        if default_test_message
+        else "SafeSight notice for {name}: alert log updated. Ref {ref}."
     )
 
     sent = 0
@@ -4092,7 +4160,25 @@ async def send_test_sms(body: SmsTestRequest, db=Depends(get_db), captain=Depend
     recipients = []
 
     for responder in responders:
+        responder_name = responder.get("full_name") or "Responder"
+        message = _format_test_sms_message(base_message, cam_name, cam_location, responder_name)
+        if not message:
+            message = f"SafeSight notice for {responder_name}. Ref {uuid.uuid4().hex[:6].upper()}."
+
         send_result = await _send_sms_via_api(responder.get("phone_number", ""), message)
+        if not send_result.get("ok") and _provider_rejected_spam(send_result):
+            fallback_template = SMS_TEST_SPAM_FALLBACK_MESSAGE.strip() if SMS_TEST_SPAM_FALLBACK_MESSAGE else ""
+            fallback_message = _format_test_sms_message(
+                fallback_template,
+                cam_name,
+                cam_location,
+                responder_name,
+            )
+            if fallback_message and fallback_message != message:
+                fallback_result = await _send_sms_via_api(responder.get("phone_number", ""), fallback_message)
+                fallback_result["used_spam_fallback"] = True
+                fallback_result["initial_error"] = send_result.get("error")
+                send_result = fallback_result
         stored_message = send_result.get("message_used") or message
         await _store_alert_record(
             db=db,

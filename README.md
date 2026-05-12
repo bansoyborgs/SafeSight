@@ -62,6 +62,8 @@ Configure these in `backend/.env`:
 - `SMS_API_FROM_FIELD`: sender field name in payload (default `from`)
 - `SMS_API_EXTRA_JSON`: extra JSON object merged into payload (optional)
 - `SMS_API_TIMEOUT_SECONDS`: request timeout in seconds
+- `SMS_TEST_MESSAGE`: default test message (optional). Supports `{ref}`, `{camera}`, `{location}`, `{name}` placeholders.
+- `SMS_TEST_SPAM_FALLBACK_MESSAGE`: optional fallback used when UniSMS flags test content as spam. Supports `{ref}`, `{camera}`, `{location}`, `{name}`.
 - `PUBLIC_BASE_URL`: public base URL used in SMS clip links (example: `https://your-domain.com`)
 
 ### UniSMS Quick Configuration
